@@ -56,41 +56,70 @@ def skin_color_mask(bgr, loose=False):
         skin = ((Cr >= 133) & (Cr <= 178) & (Cb >= 77) & (Cb <= 132))
     return skin.astype(np.uint8) * 255
 
+FACEMESH_LEFT_EYE_IDX = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+FACEMESH_RIGHT_EYE_IDX = [263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466]
+FACEMESH_LEFT_EYEBROW_IDX = [70, 63, 105, 66, 107, 55, 65, 52, 53, 46]
+FACEMESH_RIGHT_EYEBROW_IDX = [336, 296, 334, 293, 300, 285, 295, 282, 283, 276]
+FACEMESH_LIPS_IDX = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185,
+                    78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 415, 310, 311, 312, 13, 82, 81, 80, 191]
+FACEMESH_FACE_OVAL_IDX = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377,
+                          152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
+FACEMESH_NOSTRILS_IDX = [49, 48, 219, 218, 64, 60, 75, 4, 305, 290, 294, 279, 278, 438, 439, 459]
+
+MP_FACE_LANDMARKER_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+MP_FACE_LANDMARKER_PATH = os.path.join(
+    os.path.expanduser("~"), ".cache", "skin_score", "face_landmarker.task"
+)
+
+
+def _ensure_mp_landmarker_model():
+    if os.path.exists(MP_FACE_LANDMARKER_PATH):
+        return
+    os.makedirs(os.path.dirname(MP_FACE_LANDMARKER_PATH), exist_ok=True)
+    print(f"Downloading MediaPipe FaceLandmarker model -> {MP_FACE_LANDMARKER_PATH}",
+          file=sys.stderr)
+    urllib.request.urlretrieve(MP_FACE_LANDMARKER_URL, MP_FACE_LANDMARKER_PATH)
+    print("Model downloaded.", file=sys.stderr)
+
+
 try:
-    import mediapipe as mp
-    _mp_face_mesh = mp.solutions.face_mesh
-    MP_FACE_MESH = _mp_face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
+    import mediapipe as _mp
+    from mediapipe.tasks import python as _mp_python
+    from mediapipe.tasks.python import vision as _mp_vision
+
+    _ensure_mp_landmarker_model()
+    _mp_options = _mp_vision.FaceLandmarkerOptions(
+        base_options=_mp_python.BaseOptions(model_asset_path=MP_FACE_LANDMARKER_PATH),
+        running_mode=_mp_vision.RunningMode.IMAGE,
+        num_faces=1,
     )
+    MP_FACE_LANDMARKER = _mp_vision.FaceLandmarker.create_from_options(_mp_options)
     HAVE_MEDIAPIPE = True
-    print("MediaPipe FaceMesh enabled (468 landmarks)", file=sys.stderr)
+    print("MediaPipe FaceLandmarker enabled (478 landmarks)", file=sys.stderr)
 except Exception as _e:
     HAVE_MEDIAPIPE = False
-    MP_FACE_MESH = None
-    _mp_face_mesh = None
+    MP_FACE_LANDMARKER = None
+    _mp = None
     print(f"MediaPipe unavailable, using YuNet 5-landmark fallback ({_e})",
           file=sys.stderr)
 
 
-def _polygon_from_connections(pts, connections):
-    indices = sorted(set(i for pair in connections for i in pair))
-    return pts[indices].astype(np.int32)
-
-
 def detect_face_mp(bgr):
-    """MediaPipe FaceMesh detection — 468 landmarks → precise region polygons
-    and a pixel-accurate face-skin polygon mask (face oval minus eyes, brows, lips)."""
+    """MediaPipe FaceLandmarker (Tasks API) — 478 landmarks → precise region
+    polygons and a pixel-accurate face-skin polygon mask
+    (face oval minus eyes, brows, lips, nostrils)."""
     if not HAVE_MEDIAPIPE:
         return None
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    res = MP_FACE_MESH.process(rgb)
-    if not res.multi_face_landmarks:
+    mp_image = _mp.Image(image_format=_mp.ImageFormat.SRGB, data=rgb)
+    result = MP_FACE_LANDMARKER.detect(mp_image)
+    if not result.face_landmarks:
         return None
     H, W = bgr.shape[:2]
-    lms = res.multi_face_landmarks[0].landmark
+    lms = result.face_landmarks[0]
     pts = np.array([(lm.x * W, lm.y * H) for lm in lms], dtype=np.float32)
 
     def pi(idx):
@@ -104,30 +133,21 @@ def detect_face_mp(bgr):
     chin = pi(152)
     forehead_top = pi(10)
 
-    oval_pts = _polygon_from_connections(pts, _mp_face_mesh.FACEMESH_FACE_OVAL)
+    oval_pts = pts[FACEMESH_FACE_OVAL_IDX].astype(np.int32)
     x0, y0 = oval_pts.min(axis=0)
     x1, y1 = oval_pts.max(axis=0)
     fx, fy, fw, fh = int(x0), int(y0), int(x1 - x0), int(y1 - y0)
 
     skin_poly_mask = np.zeros((H, W), dtype=np.uint8)
-    hull = cv2.convexHull(oval_pts)
-    cv2.fillPoly(skin_poly_mask, [hull], 255)
+    cv2.fillPoly(skin_poly_mask, [oval_pts], 255)
 
-    for connections in (
-        _mp_face_mesh.FACEMESH_LEFT_EYE,
-        _mp_face_mesh.FACEMESH_RIGHT_EYE,
-        _mp_face_mesh.FACEMESH_LEFT_EYEBROW,
-        _mp_face_mesh.FACEMESH_RIGHT_EYEBROW,
-        _mp_face_mesh.FACEMESH_LIPS,
-    ):
-        region_pts = _polygon_from_connections(pts, connections)
+    for idx_list in (FACEMESH_LEFT_EYE_IDX, FACEMESH_RIGHT_EYE_IDX,
+                     FACEMESH_LEFT_EYEBROW_IDX, FACEMESH_RIGHT_EYEBROW_IDX,
+                     FACEMESH_LIPS_IDX, FACEMESH_NOSTRILS_IDX):
+        region_pts = pts[idx_list].astype(np.int32)
         if len(region_pts) >= 3:
-            sub_hull = cv2.convexHull(region_pts)
-            sub_hull = sub_hull + np.array([[0, 0]])
-            cv2.fillPoly(skin_poly_mask, [sub_hull], 0)
-    nostrils = pts[[64, 49, 48, 219, 218, 60, 290, 305, 278, 279, 294]].astype(np.int32)
-    if len(nostrils) >= 3:
-        cv2.fillPoly(skin_poly_mask, [cv2.convexHull(nostrils)], 0)
+            hull = cv2.convexHull(region_pts)
+            cv2.fillPoly(skin_poly_mask, [hull], 0)
 
     eye_dist = max(20, int(np.hypot(re_[0] - le[0], re_[1] - le[1])))
     eye_mid = ((le[0] + re_[0]) // 2, (le[1] + re_[1]) // 2)
@@ -515,13 +535,14 @@ def score_dark_spots(bgr, mask, baseline_L=None):
     brightness — darker skin needs a smaller absolute L delta to qualify."""
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     L = lab[:, :, 0]
-    blurred = cv2.GaussianBlur(L, (25, 25), 0)
-    diff = blurred.astype(np.int16) - L.astype(np.int16)
+    L_smooth = cv2.medianBlur(L, 5)
+    blurred = cv2.GaussianBlur(L_smooth, (25, 25), 0)
+    diff = blurred.astype(np.int16) - L_smooth.astype(np.int16)
     vals = diff[mask > 0]
     if vals.size < 50:
         return 50
     if baseline_L is not None:
-        thr = int(max(7, min(20, baseline_L * 0.09)))
+        thr = int(max(10, min(20, baseline_L * 0.09)))
     else:
         thr = 15
     dark_frac = float((vals > thr).mean())
@@ -536,12 +557,17 @@ def score_blemish(bgr, mask, baseline_L=None):
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     L = lab[:, :, 0]
     a = lab[:, :, 1].astype(np.float32) - 128
-    blurred_L = cv2.GaussianBlur(L, (25, 25), 0)
-    dark_diff = blurred_L.astype(np.int16) - L.astype(np.int16)
-    blurred_a = cv2.GaussianBlur(a, (25, 25), 0)
-    red_diff = a - blurred_a
+    
+    L_smooth = cv2.medianBlur(L, 5)
+    blurred_L = cv2.GaussianBlur(L_smooth, (25, 25), 0)
+    dark_diff = blurred_L.astype(np.int16) - L_smooth.astype(np.int16)
+    
+    a_smooth = cv2.GaussianBlur(a, (5, 5), 0)
+    blurred_a = cv2.GaussianBlur(a_smooth, (25, 25), 0)
+    red_diff = a_smooth - blurred_a
+    
     if baseline_L is not None:
-        dark_thr = int(max(8, min(20, baseline_L * 0.09)))
+        dark_thr = int(max(10, min(20, baseline_L * 0.09)))
     else:
         dark_thr = 15
     anomalies = ((dark_diff > dark_thr) | (red_diff > 8)) & (mask > 0)
@@ -742,20 +768,24 @@ def build_issue_overlays(bgr, viz_masks, baseline_L, baseline_a):
 
     out = {}
 
-    blurred_L = cv2.GaussianBlur(L, (25, 25), 0)
-    dark_diff = blurred_L.astype(np.int16) - L.astype(np.int16)
-    bL = baseline_L if baseline_L is not None else 150
-    dark_thr = int(max(8, min(20, bL * 0.10)))
+    L_smooth = cv2.medianBlur(L, 5)
+    blurred_L = cv2.GaussianBlur(L_smooth, (25, 25), 0)
+    dark_diff = blurred_L.astype(np.int16) - L_smooth.astype(np.int16)
+    if baseline_L is not None:
+        dark_thr = int(max(10, min(20, baseline_L * 0.09)))
+    else:
+        dark_thr = 15
     out["Dark Spots"] = ((dark_diff > dark_thr) & (face_skin > 0)).astype(np.uint8) * 255
 
-    blurred_a = cv2.GaussianBlur(a, (25, 25), 0)
-    red_diff = a - blurred_a
+    a_smooth = cv2.GaussianBlur(a, (5, 5), 0)
+    blurred_a = cv2.GaussianBlur(a_smooth, (25, 25), 0)
+    red_diff = a_smooth - blurred_a
     out["Blemish prone"] = (((dark_diff > dark_thr) | (red_diff > 8)) & (face_skin > 0)).astype(np.uint8) * 255
 
     ba = baseline_a if baseline_a is not None else 0
     out["Redness prone"] = ((a - ba > 7) & (cheeks > 0)).astype(np.uint8) * 255
 
-    bright_thr = int(max(220, min(248, bL + 45)))
+    bright_thr = 235
     out["Oiliness/Shine"] = ((gray > bright_thr) & (fh_nose > 0)).astype(np.uint8) * 255
 
     g2 = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -933,7 +963,7 @@ def render_card(face_thumb, mask_crop, condition, score, card_w=320, card_h=450)
     thumb_h_render = int(fh_h * scale)
     thumb_resized = cv2.resize(face_thumb, (thumb_w, thumb_h_render), interpolation=cv2.INTER_AREA)
     if mask_crop is not None and mask_crop.any():
-        mask_resized = cv2.resize(mask_crop, (thumb_w, thumb_h_render), interpolation=cv2.INTER_LINEAR)
+        mask_resized = cv2.resize(mask_crop, (thumb_w, thumb_h_render), interpolation=cv2.INTER_NEAREST)
         apply_overlay(thumb_resized, mask_resized, condition)
     card[pad:pad + thumb_h_render, pad:pad + thumb_w] = thumb_resized
 

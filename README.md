@@ -51,7 +51,8 @@ Webcam frame
 | `imfarzanansari/skintelligent-acne`           | Acne severity (5 classes)          | Apache  |
 | `imfarzanansari/skintelligent-wrinkles`       | Binary wrinkle classifier          | Apache  |
 | `dima806/skin_types_image_detection`          | Skin type: dry / normal / oily     | Apache  |
-| OpenCV YuNet (`face_detection_yunet_2023mar`) | Face detection + 5 facial landmarks | Apache |
+| OpenCV YuNet (`face_detection_yunet_2023mar`) | Face detection + 5 facial landmarks (fallback) | Apache |
+| MediaPipe `face_landmarker.task` (float16)    | 478 facial landmarks + skin polygon mask        | Apache |
 
 All models are downloaded automatically on first run.
 
@@ -73,6 +74,8 @@ torch
 transformers
 pillow
 huggingface_hub
+mediapipe        # 468-landmark face mesh — falls back to YuNet if unavailable
+streamlit        # only for the web app (app.py); CLI works without it
 ```
 
 ---
@@ -82,32 +85,39 @@ huggingface_hub
 ```bash
 git clone https://github.com/Ahmad1765/Skin-Condition-Detector-AI.git
 cd Skin-Condition-Detector-AI
-pip install opencv-python numpy torch transformers pillow huggingface_hub
+pip install opencv-python numpy torch transformers pillow huggingface_hub mediapipe streamlit
 ```
 
 ---
 
 ## Usage
 
-### Webcam mode
+### Web app (recommended — easiest to test)
 
 ```bash
-python skin_score.py
+streamlit run app.py
 ```
 
-### Video / image source
+Opens a browser tab at `http://localhost:8501`. Use the **Webcam** tab to snap a
+photo or the **Upload** tab to drop in any face photo. The grid of condition
+cards renders below.
+
+### Desktop / CLI mode
 
 ```bash
-python skin_score.py path/to/video.mp4
+python skin_score.py                 # webcam
+python skin_score.py path/to/img.jpg # static image / video
 ```
 
-### Controls
+### Desktop controls
 
-| Key       | Action                  |
-| --------- | ----------------------- |
-| `SPACE`   | Capture and analyze     |
-| `R`       | Retake (discard result) |
-| `Q` / `ESC` | Quit                  |
+| Key            | Action                  |
+| -------------- | ----------------------- |
+| `SPACE`        | Capture and analyze     |
+| `R`            | Retake (discard result) |
+| `B`            | Toggle landmark boxes (preview) |
+| `Up`/`Down` or `J`/`K` | Scroll result grid |
+| `Q` / `ESC`    | Quit                    |
 
 ---
 
@@ -138,7 +148,8 @@ To use a different cache location, set the `HF_HOME` environment variable before
 
 ```
 Skin-Condition-Detector-AI/
-├── skin_score.py        # Main application (single-file)
+├── skin_score.py        # Core analysis + CLI desktop app
+├── app.py               # Streamlit web app
 ├── README.md            # This file
 └── .gitignore
 ```
