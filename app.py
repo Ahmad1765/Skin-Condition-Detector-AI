@@ -51,6 +51,8 @@ with st.sidebar:
     n_frames = st.slider("Frames to average", 1, 12, 8,
                          help="More frames = less noise, slower.")
     cols_per_row = st.slider("Cards per row", 2, 5, 3)
+    use_super_res = st.checkbox("Enable AI Super-Resolution", False,
+                                help="Upscales the image using FSRCNN before analysis to detect micro-details. May increase processing time.")
     show_debug = st.checkbox("Show raw DEBUG values", False)
     if ss.HAVE_MEDIAPIPE:
         st.success("MediaPipe FaceMesh: 468 landmarks")
@@ -106,6 +108,9 @@ with tab_upload:
 
 if img_file is not None:
     bgr = _to_bgr(img_file)
+
+    if use_super_res:
+        bgr = ss.upsample_image(bgr)
 
     progress = st.empty()
     progress.info(f"Analyzing across {n_frames} virtual frames (jitter for noise reduction)...")

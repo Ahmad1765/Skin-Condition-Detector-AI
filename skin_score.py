@@ -22,6 +22,18 @@ os.makedirs(r"D:\hf_cache", exist_ok=True)
 
 import cv2
 import numpy as np
+from skimage.feature import local_binary_pattern
+
+def get_gabor_filters():
+    filters = []
+    ksize = 15
+    for theta in np.arange(0, np.pi, np.pi / 4):
+        kern = cv2.getGaborKernel((ksize, ksize), 4.0, theta, 10.0, 0.5, 0, ktype=cv2.CV_32F)
+        kern /= 1.5 * kern.sum()
+        filters.append(kern)
+    return filters
+
+GABOR_FILTERS = get_gabor_filters()
 
 
 HAAR_DIR = cv2.data.haarcascades
@@ -253,9 +265,11 @@ def _to_dict(preds):
     return {p["label"]: float(p["score"]) for p in preds}
 
 
-def cnn_predict(bgr_face_crop):
+def cnn_predict(bgr_face_crop, mask_crop=None):
     """Run 3 ViT models on a face crop. Returns dict of 4 scores 0-100."""
     rgb = cv2.cvtColor(bgr_face_crop, cv2.COLOR_BGR2RGB)
+    if mask_crop is not None:
+        rgb[mask_crop == 0] = [0, 0, 0]
     pil = Image.fromarray(rgb)
 
     acne = _to_dict(ACNE_CLF(pil))
@@ -446,17 +460,16 @@ def to_score(value, low, high, invert=False):
 
 
 def score_hydration(bgr, mask):
-    """Skin micro-roughness via high-pass filter on L channel."""
+    """Skin micro-roughness via Local Binary Patterns (LBP) on L channel."""
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-    L = lab[:, :, 0].astype(np.float32)
-    smooth = cv2.bilateralFilter(L, 7, 30, 30)
-    detail = L - smooth
-    vals = detail[mask > 0]
+    L = lab[:, :, 0]
+    lbp = local_binary_pattern(L, P=8, R=1, method='uniform')
+    vals = lbp[mask > 0]
     if vals.size < 50:
         return 50
     roughness = float(np.std(vals))
-    DEBUG["hydration_roughness_std"] = round(roughness, 2)
-    return to_score(roughness, 2.0, 6.0, invert=True)
+    DEBUG["hydration_lbp_std"] = round(roughness, 2)
+    return to_score(roughness, 1.0, 3.5, invert=True)
 
 
 def score_redness(bgr, mask, baseline_a=None):
@@ -464,7 +477,8 @@ def score_redness(bgr, mask, baseline_a=None):
     measure cheek deviation from same person's baseline — tone-invariant."""
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     a = lab[:, :, 1].astype(np.float32) - 128
-    vals = a[mask > 0]
+    a_smooth = cv2.GaussianBlur(a, (5, 5), 0)
+    vals = a_smooth[mask > 0]
     if vals.size < 50:
         return 50
     mean_a = float(vals.mean())
@@ -477,34 +491,40 @@ def score_redness(bgr, mask, baseline_a=None):
 
 
 def score_oiliness(bgr, mask):
-    """Fraction of very-bright pixels (specular highlights) on T-zone."""
+    """Fraction of very-bright pixels (specular highlights) on T-zone using Tophat transform."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    pixels = gray[mask > 0]
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+    pixels = tophat[mask > 0]
     if pixels.size < 50:
         return 50
-    bright_frac = float((pixels > 235).mean())
+    bright_frac = float((pixels > 15).mean())
     DEBUG["oiliness_bright_frac"] = bright_frac
     return to_score(bright_frac, 0.005, 0.35, invert=True)
 
 
 def score_texture(bgr, mask):
-    """Texture irregularity via high-pass detail std on bilateral-smoothed gray.
-    Wider range so normal pores don't drag everyone to 30."""
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    smooth = cv2.bilateralFilter(gray, 7, 30, 30)
-    detail = gray - smooth
-    vals = detail[mask > 0]
+    """Texture irregularity via Local Binary Patterns (LBP) on gray."""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    lbp = local_binary_pattern(gray, P=8, R=1, method='uniform')
+    vals = lbp[mask > 0]
     if vals.size < 50:
         return 50
     rough = float(np.std(vals))
-    DEBUG["texture_rough_std"] = round(rough, 2)
-    return to_score(rough, 1.5, 7.0, invert=True)
+    DEBUG["texture_lbp_std"] = round(rough, 2)
+    return to_score(rough, 1.0, 3.5, invert=True)
 
 
 def score_wrinkles(bgr, masks_list):
+    """Uses Gabor filter bank and Canny edges in specific facial regions."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    edges = cv2.Canny(gray, 30, 80)
+    accum = np.zeros_like(gray, dtype=np.float32)
+    for kern in GABOR_FILTERS:
+        fimg = cv2.filter2D(gray, cv2.CV_32F, kern)
+        np.maximum(accum, fimg, accum)
+    gabor_img = accum.astype(np.uint8)
+    edges = cv2.Canny(gabor_img, 30, 80)
+    
     combined = np.zeros_like(edges)
     for m in masks_list:
         combined |= m
@@ -531,24 +551,27 @@ def score_dark_circles(bgr, under_eye_mask, cheek_mask):
 
 
 def score_dark_spots(bgr, mask, baseline_L=None):
-    """Local-darker-than-surround fraction. Threshold scales with skin
-    brightness — darker skin needs a smaller absolute L delta to qualify."""
+    """Local-darker-than-surround fraction. Uses morphological blackhat to isolate spots and ignore shadows."""
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     L = lab[:, :, 0]
-    L_smooth = cv2.medianBlur(L, 5)
-    blurred = cv2.GaussianBlur(L_smooth, (25, 25), 0)
-    diff = blurred.astype(np.int16) - L_smooth.astype(np.int16)
-    vals = diff[mask > 0]
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    L_clahe = clahe.apply(L)
+    L_smooth = cv2.medianBlur(L_clahe, 5)
+    
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    blackhat = cv2.morphologyEx(L_smooth, cv2.MORPH_BLACKHAT, kernel)
+    
+    vals = blackhat[mask > 0]
     if vals.size < 50:
         return 50
     if baseline_L is not None:
-        thr = int(max(10, min(20, baseline_L * 0.09)))
+        thr = int(max(10, min(18, baseline_L * 0.08)))
     else:
-        thr = 15
+        thr = 12
     dark_frac = float((vals > thr).mean())
     DEBUG["dark_spots_thr"] = thr
     DEBUG["dark_spots_frac"] = round(dark_frac, 4)
-    return to_score(dark_frac, 0.01, 0.18, invert=True)
+    return to_score(dark_frac, 0.015, 0.15, invert=True)
 
 
 def score_blemish(bgr, mask, baseline_L=None):
@@ -558,19 +581,21 @@ def score_blemish(bgr, mask, baseline_L=None):
     L = lab[:, :, 0]
     a = lab[:, :, 1].astype(np.float32) - 128
     
-    L_smooth = cv2.medianBlur(L, 5)
-    blurred_L = cv2.GaussianBlur(L_smooth, (25, 25), 0)
-    dark_diff = blurred_L.astype(np.int16) - L_smooth.astype(np.int16)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    L_clahe = clahe.apply(L)
+    L_smooth = cv2.medianBlur(L_clahe, 5)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    blackhat = cv2.morphologyEx(L_smooth, cv2.MORPH_BLACKHAT, kernel)
     
     a_smooth = cv2.GaussianBlur(a, (5, 5), 0)
     blurred_a = cv2.GaussianBlur(a_smooth, (25, 25), 0)
     red_diff = a_smooth - blurred_a
     
     if baseline_L is not None:
-        dark_thr = int(max(10, min(20, baseline_L * 0.09)))
+        dark_thr = int(max(10, min(18, baseline_L * 0.08)))
     else:
-        dark_thr = 15
-    anomalies = ((dark_diff > dark_thr) | (red_diff > 8)) & (mask > 0)
+        dark_thr = 12
+    anomalies = ((blackhat > dark_thr) | (red_diff > 8)) & (mask > 0)
     region_size = int((mask > 0).sum())
     if region_size < 1000:
         return 50
@@ -749,7 +774,7 @@ def smooth_mask(mask, kind="blob"):
     return mask
 
 
-def build_issue_overlays(bgr, viz_masks, baseline_L, baseline_a):
+def build_issue_overlays(bgr, viz_masks, baseline_L, baseline_a, scores=None):
     """Per-issue binary masks for visualization.
     Thresholds match the scoring functions so overlays only fire where the
     score would also penalize — fewer false positives, only real issues."""
@@ -768,46 +793,64 @@ def build_issue_overlays(bgr, viz_masks, baseline_L, baseline_a):
 
     out = {}
 
-    L_smooth = cv2.medianBlur(L, 5)
-    blurred_L = cv2.GaussianBlur(L_smooth, (25, 25), 0)
-    dark_diff = blurred_L.astype(np.int16) - L_smooth.astype(np.int16)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    L_clahe = clahe.apply(L)
+    L_smooth = cv2.medianBlur(L_clahe, 5)
+    kernel_bh = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    blackhat = cv2.morphologyEx(L_smooth, cv2.MORPH_BLACKHAT, kernel_bh)
+    
     if baseline_L is not None:
-        dark_thr = int(max(10, min(20, baseline_L * 0.09)))
+        dark_thr = int(max(10, min(18, baseline_L * 0.08)))
     else:
-        dark_thr = 15
-    out["Dark Spots"] = ((dark_diff > dark_thr) & (face_skin > 0)).astype(np.uint8) * 255
+        dark_thr = 12
+    out["Dark Spots"] = ((blackhat > dark_thr) & (face_skin > 0)).astype(np.uint8) * 255
 
     a_smooth = cv2.GaussianBlur(a, (5, 5), 0)
     blurred_a = cv2.GaussianBlur(a_smooth, (25, 25), 0)
     red_diff = a_smooth - blurred_a
-    out["Blemish prone"] = (((dark_diff > dark_thr) | (red_diff > 8)) & (face_skin > 0)).astype(np.uint8) * 255
+    out["Blemish prone"] = (((blackhat > dark_thr) | (red_diff > 8)) & (face_skin > 0)).astype(np.uint8) * 255
 
     ba = baseline_a if baseline_a is not None else 0
-    out["Redness prone"] = ((a - ba > 7) & (cheeks > 0)).astype(np.uint8) * 255
+    out["Redness prone"] = ((a_smooth - ba > 7) & (cheeks > 0)).astype(np.uint8) * 255
 
-    bright_thr = 235
-    out["Oiliness/Shine"] = ((gray > bright_thr) & (fh_nose > 0)).astype(np.uint8) * 255
+    kernel_th = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel_th)
+    out["Oiliness/Shine"] = ((tophat > 15) & (fh_nose > 0)).astype(np.uint8) * 255
 
-    g2 = cv2.GaussianBlur(gray, (3, 3), 0)
-    edges = cv2.Canny(g2, 35, 90)
+    smooth_gray = cv2.bilateralFilter(gray, 9, 50, 50)
+    edges = cv2.Canny(smooth_gray, 30, 80)
     out["Wrinkles"] = cv2.bitwise_and(edges, wrinkle_regions)
 
     smooth_g = cv2.bilateralFilter(gray.astype(np.float32), 7, 30, 30)
     detail_g = np.abs(gray.astype(np.float32) - smooth_g)
-    out["Texture"] = ((detail_g > 3.5) & (cheeks > 0)).astype(np.uint8) * 255
+    std_g = np.std(detail_g[cheeks > 0]) if (cheeks > 0).any() else 3.5
+    thr_g = max(3.0, std_g * 1.5)
+    out["Texture"] = ((detail_g > thr_g) & (cheeks > 0)).astype(np.uint8) * 255
 
     smooth_L = cv2.bilateralFilter(L.astype(np.float32), 7, 30, 30)
     detail_L = np.abs(L.astype(np.float32) - smooth_L)
-    out["Hydration"] = ((detail_L > 3.5) & (cheeks > 0)).astype(np.uint8) * 255
+    std_L = np.std(detail_L[cheeks > 0]) if (cheeks > 0).any() else 3.5
+    thr_L = max(3.0, std_L * 1.5)
+    out["Hydration"] = ((detail_L > thr_L) & (cheeks > 0)).astype(np.uint8) * 255
 
-    out["Dark Circles"] = under_eyes.copy()
-
-    if baseline_L is not None:
-        out["Radiance"] = ((L < baseline_L - 12) & (face_skin > 0)).astype(np.uint8) * 255
+    cheek_L_vals = L[cheeks > 0]
+    if cheek_L_vals.size > 0:
+        cheek_median_L = np.median(cheek_L_vals)
+        out["Dark Circles"] = ((L < cheek_median_L - 8) & (under_eyes > 0)).astype(np.uint8) * 255
     else:
-        out["Radiance"] = ((L < 115) & (face_skin > 0)).astype(np.uint8) * 255
+        out["Dark Circles"] = np.zeros_like(under_eyes)
 
-    out["Firmness"] = jaw.copy()
+    face_L_vals = L[face_skin > 0]
+    if face_L_vals.size > 0:
+        face_median_L = np.median(face_L_vals)
+        out["Radiance"] = ((L < face_median_L - 15) & (face_skin > 0)).astype(np.uint8) * 255
+    else:
+        out["Radiance"] = np.zeros_like(L)
+
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.sqrt(gx * gx + gy * gy)
+    out["Firmness"] = ((mag < 15) & (jaw > 0)).astype(np.uint8) * 255
     return out
 
 
@@ -1025,6 +1068,18 @@ def render_card_grid(snapshot, regs, scores, overlays, cols=5, gap=18):
     return canvas
 
 
+def upsample_image(bgr):
+    model_path = "FSRCNN_x2.pb"
+    if os.path.exists(model_path):
+        try:
+            sr = cv2.dnn_superres.DnnSuperResImpl_create()
+            sr.readModel(model_path)
+            sr.setModel("fsrcnn", 2)
+            return sr.upsample(bgr)
+        except Exception as e:
+            print(f"Super-res failed: {e}", file=sys.stderr)
+    return bgr
+
 def analyze(bgr):
     DEBUG.clear()
     regs = detect_face_and_eyes(bgr)
@@ -1108,20 +1163,28 @@ def analyze(bgr):
         "wrinkle_regions": union(fh_v, lec_v, rec_v, mouth_v),
         "jaw": jaw_v,
     }
-    overlays = build_issue_overlays(bgr, viz_masks, baseline_L, baseline_a)
-
     fx, fy, fw, fh_ = regs["face"]
     pad = int(0.10 * max(fw, fh_))
     H, W = bgr.shape[:2]
     cx0 = max(0, fx - pad); cy0 = max(0, fy - pad)
     cx1 = min(W, fx + fw + pad); cy1 = min(H, fy + fh_ + pad)
     face_crop = bgr[cy0:cy1, cx0:cx1]
+    
+    clean_skin = build_clean_skin_mask(bgr, regs)
+    mask_crop = clean_skin[cy0:cy1, cx0:cx1]
+    
     if face_crop.size > 0:
         try:
-            cnn_scores = cnn_predict(face_crop)
-            scores.update(cnn_scores)
+            cnn_scores = cnn_predict(face_crop, mask_crop)
+            for k, v in cnn_scores.items():
+                if k in scores:
+                    scores[k] = int(round(0.5 * scores[k] + 0.5 * v))
+                else:
+                    scores[k] = v
         except Exception as e:
             print(f"CNN inference failed: {e}", file=sys.stderr)
+
+    overlays = build_issue_overlays(bgr, viz_masks, baseline_L, baseline_a, scores)
 
     return scores, regs, overlays
 
