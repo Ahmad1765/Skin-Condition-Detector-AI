@@ -29,11 +29,69 @@ def get_gabor_filters():
     ksize = 15
     for theta in np.arange(0, np.pi, np.pi / 4):
         kern = cv2.getGaborKernel((ksize, ksize), 4.0, theta, 10.0, 0.5, 0, ktype=cv2.CV_32F)
-        kern /= 1.5 * kern.sum()
+        # Zero-DC + L1 norm: response measures local ridge contrast only.
+        # A non-zero DC gain makes the filter respond to plain brightness,
+        # so Canny then "detects" skin tone instead of wrinkle lines.
+        kern -= kern.mean()
+        kern /= np.abs(kern).sum()
         filters.append(kern)
     return filters
 
 GABOR_FILTERS = get_gabor_filters()
+
+
+def gabor_ridge_response(gray):
+    """Max |response| over the zero-DC Gabor bank.
+    Units: local ridge contrast in gray levels (smooth skin < ~2,
+    real wrinkle lines ~10-30 at TARGET_EYE_DIST scale)."""
+    g = gray.astype(np.float32)
+    accum = np.zeros_like(g, dtype=np.float32)
+    for kern in GABOR_FILTERS:
+        np.maximum(accum, np.abs(cv2.filter2D(g, cv2.CV_32F, kern)), accum)
+    return accum
+
+
+# All pixel-size kernels (tophat 31px, blackhat 15px, Gabor lambda 10px) and
+# the to_score calibration ranges assume a face at roughly this inter-ocular
+# distance. analyze() rescales the input so every image is measured at the
+# same effective resolution.
+TARGET_EYE_DIST = 160.0
+
+
+def facial_hair_mask(bgr, regs, baseline_L=None):
+    """Beard / brows / hairline pixels inside the face box.
+    Hair blended with skin often passes the YCrCb color filter, so color
+    alone lets beards contaminate the jaw/cheek/mouth metrics (on the test
+    face, jaw pixels passing the color filter had median L 176 vs 224 for
+    real skin). Hair = clearly darker than the person's skin baseline OR
+    dense fine-ridge texture (stubble), kept only as LARGE connected
+    fields — small isolated dark blobs are left in place so the
+    dark-spot/blemish metrics still see real spots.
+    Calibrated at TARGET_EYE_DIST scale."""
+    H, W = bgr.shape[:2]
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    L = lab[:, :, 0].astype(np.float32)
+    face_rect = rect_to_mask(regs["face"], bgr.shape)
+    if baseline_L is None:
+        skin = skin_color_mask(bgr)
+        vals = L[(face_rect & skin) > 0]
+        if vals.size < 50:
+            return np.zeros((H, W), dtype=np.uint8)
+        baseline_L = float(np.median(vals))
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    ridge = gabor_ridge_response(gray)
+    dark = L < baseline_L * 0.78
+    stubble = (ridge > 5.0) & (L < baseline_L * 0.90)
+    cand = ((dark | stubble).astype(np.uint8) * 255) & face_rect
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    m = cv2.morphologyEx(cand, cv2.MORPH_CLOSE, k)
+    nb, lbl, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    min_area = int((0.10 * TARGET_EYE_DIST) ** 2)
+    hair = np.zeros_like(m)
+    for i in range(1, nb):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            hair[lbl == i] = 255
+    return cv2.dilate(hair, k)
 
 
 HAAR_DIR = cv2.data.haarcascades
@@ -269,6 +327,10 @@ def cnn_predict(bgr_face_crop, mask_crop=None):
     """Run 3 ViT models on a face crop. Returns dict of 4 scores 0-100."""
     rgb = cv2.cvtColor(bgr_face_crop, cv2.COLOR_BGR2RGB)
     if mask_crop is not None:
+        if mask_crop.ndim == 3:
+            mask_crop = mask_crop[:, :, 0]
+        if mask_crop.ndim != 2 or mask_crop.shape != bgr_face_crop.shape[:2]:
+            raise ValueError(f"mask_crop shape {mask_crop.shape} does not match bgr_face_crop spatial shape {bgr_face_crop.shape[:2]}")
         rgb[mask_crop == 0] = [0, 0, 0]
     pil = Image.fromarray(rgb)
 
@@ -469,7 +531,7 @@ def score_hydration(bgr, mask):
         return 50
     roughness = float(np.std(vals))
     DEBUG["hydration_lbp_std"] = round(roughness, 2)
-    return to_score(roughness, 1.0, 3.5, invert=True)
+    return to_score(roughness, 1.2, 3.2, invert=True)
 
 
 def score_redness(bgr, mask, baseline_a=None):
@@ -512,28 +574,28 @@ def score_texture(bgr, mask):
         return 50
     rough = float(np.std(vals))
     DEBUG["texture_lbp_std"] = round(rough, 2)
-    return to_score(rough, 1.0, 3.5, invert=True)
+    return to_score(rough, 1.2, 3.2, invert=True)
 
 
 def score_wrinkles(bgr, masks_list):
-    """Uses Gabor filter bank and Canny edges in specific facial regions."""
+    """Zero-DC Gabor ridge bank on forehead + eye corners.
+    Scores the 75th percentile of ridge contrast: robust to small patches
+    of hair/region-border contamination, rises when line structures cover
+    a real share of the region. Masks are eroded so hair-boundary pixels
+    at region edges don't fake wrinkles."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    accum = np.zeros_like(gray, dtype=np.float32)
-    for kern in GABOR_FILTERS:
-        fimg = cv2.filter2D(gray, cv2.CV_32F, kern)
-        np.maximum(accum, fimg, accum)
-    gabor_img = accum.astype(np.uint8)
-    edges = cv2.Canny(gabor_img, 30, 80)
-    
-    combined = np.zeros_like(edges)
+    ridge = gabor_ridge_response(gray)
+    combined = np.zeros(gray.shape, dtype=np.uint8)
     for m in masks_list:
         combined |= m
-    region_edges = edges[combined > 0]
-    if region_edges.size < 50:
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    combined = cv2.erode(combined, k, iterations=2)
+    vals = ridge[combined > 0]
+    if vals.size < 50:
         return 50
-    edge_frac = float((region_edges > 0).mean())
-    DEBUG["wrinkles_edge_frac"] = round(edge_frac, 4)
-    return to_score(edge_frac, 0.05, 0.18, invert=True)
+    ridge_p75 = float(np.percentile(vals, 75))
+    DEBUG["wrinkles_ridge_p75"] = round(ridge_p75, 2)
+    return to_score(ridge_p75, 1.5, 8.0, invert=True)
 
 
 def score_dark_circles(bgr, under_eye_mask, cheek_mask):
@@ -605,10 +667,13 @@ def score_blemish(bgr, mask, baseline_L=None):
     return to_score(frac, 0.01, 0.18, invert=True)
 
 
-def score_radiance(bgr, mask, baseline_L=None):
-    """Brightness + tone evenness. With baseline_L, brightness is judged
-    relative to the person's own forehead so dark + light skin both
-    land near mid-scale when lighting is good."""
+def score_radiance(bgr, mask):
+    """Tone evenness (weight 0.65) + brightness (0.35).
+    NOTE: brightness must NOT be measured as a delta against the forehead
+    baseline — face_skin includes the forehead, so that delta is ~0 by
+    construction and the score gets pinned to mid-scale. Evenness (IQR)
+    carries most of the weight because it is tone-invariant; the absolute
+    brightness term only penalizes genuinely under/over-lit captures."""
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     L = lab[:, :, 0].astype(np.float32)
     vals = L[mask > 0]
@@ -619,14 +684,9 @@ def score_radiance(bgr, mask, baseline_L=None):
     iqr = float(p75 - p25)
     DEBUG["radiance_median_L"] = round(median_l, 1)
     DEBUG["radiance_iqr"] = round(iqr, 1)
-    if baseline_L is not None:
-        delta = median_l - baseline_L
-        DEBUG["radiance_delta_L"] = round(delta, 1)
-        bright_score = to_score(delta, -15, 8)
-    else:
-        bright_score = to_score(median_l, 110, 220)
+    bright_score = to_score(median_l, 70, 190)
     even_score = to_score(iqr, 10, 45, invert=True)
-    return int(round(0.5 * bright_score + 0.5 * even_score))
+    return int(round(0.35 * bright_score + 0.65 * even_score))
 
 
 def score_firmness(bgr, jaw_mask, cheek_mask):
@@ -774,7 +834,7 @@ def smooth_mask(mask, kind="blob"):
     return mask
 
 
-def build_issue_overlays(bgr, viz_masks, baseline_L, baseline_a, scores=None):
+def build_issue_overlays(bgr, viz_masks, baseline_L, baseline_a):
     """Per-issue binary masks for visualization.
     Thresholds match the scoring functions so overlays only fire where the
     score would also penalize — fewer false positives, only real issues."""
@@ -817,9 +877,9 @@ def build_issue_overlays(bgr, viz_masks, baseline_L, baseline_a, scores=None):
     tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel_th)
     out["Oiliness/Shine"] = ((tophat > 15) & (fh_nose > 0)).astype(np.uint8) * 255
 
-    smooth_gray = cv2.bilateralFilter(gray, 9, 50, 50)
-    edges = cv2.Canny(smooth_gray, 30, 80)
-    out["Wrinkles"] = cv2.bitwise_and(edges, wrinkle_regions)
+    ridge = gabor_ridge_response(gray)
+    ridge_mask = (ridge > 8.0).astype(np.uint8) * 255
+    out["Wrinkles"] = cv2.bitwise_and(ridge_mask, wrinkle_regions)
 
     smooth_g = cv2.bilateralFilter(gray.astype(np.float32), 7, 30, 30)
     detail_g = np.abs(gray.astype(np.float32) - smooth_g)
@@ -1081,12 +1141,40 @@ def upsample_image(bgr):
     return bgr
 
 def analyze(bgr):
+    """Returns (scores, regs, overlays, proc_bgr) — proc_bgr is the
+    scale-normalized image that regs/overlays coordinates refer to.
+    Callers must render with proc_bgr, not the original frame."""
     DEBUG.clear()
     regs = detect_face_and_eyes(bgr)
     if regs is None:
-        return None, None, None
+        return None, None, None, None
 
-    skin = skin_color_mask(bgr)
+    # Scale-normalize: every kernel size and threshold range below is
+    # calibrated for a face with ~TARGET_EYE_DIST px between the eyes.
+    # Without this, a 400px selfie scores wildly differently from a 720p
+    # webcam frame (e.g. tophat shine fraction 0.73 vs 0.015 on the same face).
+    lm = regs["landmarks"]
+    le, re_ = lm["left_eye"], lm["right_eye"]
+    eye_dist = float(np.hypot(re_[0] - le[0], re_[1] - le[1]))
+    scale = TARGET_EYE_DIST / max(eye_dist, 1.0)
+    scale = max(0.25, min(4.0, scale))
+    if abs(scale - 1.0) > 0.15:
+        interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+        resized = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=interp)
+        regs2 = detect_face_and_eyes(resized)
+        if regs2 is not None:
+            bgr = resized
+            regs = regs2
+            DEBUG["scale_factor"] = round(scale, 2)
+
+    # Facial hair (beard/brows/bangs) passes the color filter when blended
+    # with skin — exclude it explicitly from every measurement mask.
+    hair = facial_hair_mask(bgr, regs)
+    not_hair = cv2.bitwise_not(hair)
+    fr = rect_to_mask(regs["face"], bgr.shape)
+    DEBUG["hair_frac_face"] = round(float((hair[fr > 0] > 0).mean()), 3)
+
+    skin = skin_color_mask(bgr) & not_hair
 
     def filt(m):
         return m & skin
@@ -1095,21 +1183,32 @@ def analyze(bgr):
     rc = filt(rect_to_mask(regs["right_cheek"], bgr.shape))
     cheeks = union(lc, rc)
 
-    lue = filt(rect_to_mask(regs["left_under_eye"], bgr.shape))
-    rue = filt(rect_to_mask(regs["right_under_eye"], bgr.shape))
+    # Under-eye: do NOT filter by strict skin color — dark-circle pixels are
+    # exactly the ones the strict range drops, which inflated the score.
+    # Use the MediaPipe polygon (or loose color as fallback) instead.
+    poly = regs.get("skin_poly_mask")
+    ue_keep = poly if poly is not None else skin_color_mask(bgr, loose=True)
+    lue = rect_to_mask(regs["left_under_eye"], bgr.shape) & ue_keep
+    rue = rect_to_mask(regs["right_under_eye"], bgr.shape) & ue_keep
     under_eyes = union(lue, rue)
 
     fh = filt(rect_to_mask(regs["forehead"], bgr.shape))
     nose = filt(rect_to_mask(regs["nose"], bgr.shape))
-    mouth_raw = rect_to_mask(regs["mouth"], bgr.shape)
-    lips = detect_lip_pixels(bgr, regs["mouth"])
-    mouth = filt(mouth_raw & (~lips))
     jaw = filt(rect_to_mask(regs["jaw"], bgr.shape))
     lec = filt(rect_to_mask(regs["left_eye_corner"], bgr.shape))
     rec = filt(rect_to_mask(regs["right_eye_corner"], bgr.shape))
 
     face_skin = union(cheeks, fh, nose)
     fh_nose = union(fh, nose)
+
+    # Specular highlights lose chroma (Cr ~128) and fail the skin-color
+    # filter, which blinded the oiliness metric to the shiniest pixels.
+    # Add saturated T-zone pixels back into the oiliness region.
+    gray_full = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    specular = ((gray_full > 245).astype(np.uint8)) * 255
+    tz_rects = union(rect_to_mask(regs["forehead"], bgr.shape),
+                     rect_to_mask(regs["nose"], bgr.shape))
+    oil_region = fh_nose | (tz_rects & specular)
 
     lab_full = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     fh_L_vals = lab_full[:, :, 0][fh > 0]
@@ -1123,22 +1222,25 @@ def analyze(bgr):
         baseline_L = None
         baseline_a = None
 
-    wrinkle_regions = union(fh, lec, rec, mouth)
+    # Wrinkle regions: forehead + eye corners only. The mouth region is
+    # dominated by beard/lip-border edges on many faces and produced
+    # massive false wrinkle signal; the CNN covers that area instead.
+    wrinkle_regions = union(fh, lec, rec)
 
     scores = {
         "Hydration":      score_hydration(bgr, cheeks),
         "Blemish prone":  score_blemish(bgr, face_skin, baseline_L),
         "Redness prone":  score_redness(bgr, cheeks, baseline_a),
-        "Oiliness/Shine": score_oiliness(bgr, fh_nose),
+        "Oiliness/Shine": score_oiliness(bgr, oil_region),
         "Dark Spots":     score_dark_spots(bgr, face_skin, baseline_L),
-        "Radiance":       score_radiance(bgr, face_skin, baseline_L),
+        "Radiance":       score_radiance(bgr, face_skin),
         "Texture":        score_texture(bgr, cheeks),
         "Firmness":       score_firmness(bgr, jaw, cheeks),
-        "Wrinkles":       score_wrinkles(bgr, [fh, lec, rec, mouth]),
+        "Wrinkles":       score_wrinkles(bgr, [fh, lec, rec]),
         "Dark Circles":   score_dark_circles(bgr, under_eyes, cheeks),
     }
 
-    clean_skin = build_clean_skin_mask(bgr, regs)
+    clean_skin = build_clean_skin_mask(bgr, regs) & not_hair
     def filt_clean(m):
         return m & clean_skin
 
@@ -1150,7 +1252,6 @@ def analyze(bgr):
     lue_v = rect_to_mask(regs["left_under_eye"], bgr.shape)
     rue_v = rect_to_mask(regs["right_under_eye"], bgr.shape)
     under_eyes_v = union(lue_v, rue_v)
-    mouth_v = filt_clean(rect_to_mask(regs["mouth"], bgr.shape) & (~lips))
     jaw_v = filt_clean(rect_to_mask(regs["jaw"], bgr.shape))
     lec_v = filt_clean(rect_to_mask(regs["left_eye_corner"], bgr.shape))
     rec_v = filt_clean(rect_to_mask(regs["right_eye_corner"], bgr.shape))
@@ -1160,7 +1261,7 @@ def analyze(bgr):
         "cheeks": cheeks_v,
         "fh_nose": union(fh_v, nose_v),
         "under_eyes": under_eyes_v,
-        "wrinkle_regions": union(fh_v, lec_v, rec_v, mouth_v),
+        "wrinkle_regions": union(fh_v, lec_v, rec_v),
         "jaw": jaw_v,
     }
     fx, fy, fw, fh_ = regs["face"]
@@ -1169,24 +1270,31 @@ def analyze(bgr):
     cx0 = max(0, fx - pad); cy0 = max(0, fy - pad)
     cx1 = min(W, fx + fw + pad); cy1 = min(H, fy + fh_ + pad)
     face_crop = bgr[cy0:cy1, cx0:cx1]
-    
-    clean_skin = build_clean_skin_mask(bgr, regs)
-    mask_crop = clean_skin[cy0:cy1, cx0:cx1]
-    
+
     if face_crop.size > 0:
         try:
-            cnn_scores = cnn_predict(face_crop, mask_crop)
+            # Natural (unmasked) crop: the ViT models were trained on real
+            # face photos. Blacking out eyes/lips/background pushed them
+            # out of distribution (acne severity 0.34 vs 0.01 on the same
+            # clear-skinned test face).
+            cnn_scores = cnn_predict(face_crop)
+            # CNN weight per metric: acne/wrinkle classifiers are far more
+            # reliable than the pixel heuristics; the skin-type model is
+            # less confident, so it stays at parity.
+            cnn_weight = {"Wrinkles": 0.7, "Blemish prone": 0.6,
+                          "Oiliness/Shine": 0.5, "Hydration": 0.5}
             for k, v in cnn_scores.items():
+                w = cnn_weight.get(k, 0.5)
                 if k in scores:
-                    scores[k] = int(round(0.5 * scores[k] + 0.5 * v))
+                    scores[k] = int(round((1 - w) * scores[k] + w * v))
                 else:
                     scores[k] = v
         except Exception as e:
             print(f"CNN inference failed: {e}", file=sys.stderr)
 
-    overlays = build_issue_overlays(bgr, viz_masks, baseline_L, baseline_a, scores)
+    overlays = build_issue_overlays(bgr, viz_masks, baseline_L, baseline_a)
 
-    return scores, regs, overlays
+    return scores, regs, overlays, bgr
 
 
 def color_for_score(s):
@@ -1352,11 +1460,11 @@ def main(source=0):
                 ok2, f = cap.read()
                 if not ok2:
                     continue
-                s_i, regs_i, ov_i = analyze(f)
+                s_i, regs_i, ov_i, proc_i = analyze(f)
                 if s_i is None:
                     continue
                 collected.append(s_i)
-                last_frame = f
+                last_frame = proc_i
                 last_regs = regs_i
                 last_overlays = ov_i
             if not collected:

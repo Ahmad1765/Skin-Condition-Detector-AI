@@ -48,8 +48,6 @@ ss = get_skin_score_module()
 
 with st.sidebar:
     st.header("Settings")
-    n_frames = st.slider("Frames to average", 1, 12, 8,
-                         help="More frames = less noise, slower.")
     cols_per_row = st.slider("Cards per row", 2, 5, 3)
     use_super_res = st.checkbox("Enable AI Super-Resolution", False,
                                 help="Upscales the image using FSRCNN before analysis to detect micro-details. May increase processing time.")
@@ -113,35 +111,20 @@ if img_file is not None:
         bgr = ss.upsample_image(bgr)
 
     progress = st.empty()
-    progress.info(f"Analyzing across {n_frames} virtual frames (jitter for noise reduction)...")
+    progress.info("Analyzing...")
     t0 = time.time()
 
-    all_scores = []
-    last_regs = None
-    last_overlays = None
-    for i in range(n_frames):
-        if i == 0:
-            frame = bgr
-        else:
-            noise = np.random.normal(0, 2.0, bgr.shape).astype(np.float32)
-            frame = np.clip(bgr.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-        s, regs, ov = ss.analyze(frame)
-        if s is None:
-            continue
-        all_scores.append(s)
-        last_regs = regs
-        last_overlays = ov
+    # Single pass. The old "virtual frame" loop re-analyzed the SAME still
+    # image with added Gaussian noise — that noise directly inflated the
+    # LBP/edge-based metrics it was supposed to stabilize.
+    scores, last_regs, last_overlays, proc_bgr = ss.analyze(bgr)
 
-    if not all_scores:
+    if scores is None:
         progress.empty()
         st.error("No face detected. Try a clearer photo with the face centered and well-lit.")
     else:
-        scores = {
-            k: int(round(sum(d[k] for d in all_scores) / len(all_scores)))
-            for k in all_scores[0].keys()
-        }
         elapsed = time.time() - t0
-        progress.success(f"Done in {elapsed:.1f}s ({len(all_scores)}/{n_frames} frames used)")
+        progress.success(f"Done in {elapsed:.1f}s")
 
         st.subheader("Score summary")
         score_cols = st.columns(5)
@@ -156,7 +139,7 @@ if img_file is not None:
                           else ("normal" if label == "Good" else "inverse"))
 
         st.subheader("Your detailed skin scores")
-        _render_grid_native(bgr, last_regs, scores, last_overlays, cols=cols_per_row)
+        _render_grid_native(proc_bgr, last_regs, scores, last_overlays, cols=cols_per_row)
 
         if show_debug:
             with st.expander("DEBUG raw values (last frame)"):
@@ -165,7 +148,7 @@ if img_file is not None:
         st.download_button(
             label="Download analyzed image",
             data=cv2.imencode(".png",
-                              ss.render_card_grid(bgr, last_regs, scores,
+                              ss.render_card_grid(proc_bgr, last_regs, scores,
                                                   last_overlays, cols=cols_per_row))[1].tobytes(),
             file_name="skin_analysis.png",
             mime="image/png",
